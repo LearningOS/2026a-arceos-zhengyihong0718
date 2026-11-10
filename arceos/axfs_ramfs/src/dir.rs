@@ -165,7 +165,97 @@ impl VfsNodeOps for DirNode {
         }
     }
 
+    fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
+        log::debug!("rename at ramfs: {} -> {}", src_path, dst_path);
+
+        let (src_parent, src_name) = self.resolve_parent(src_path)?;
+        let (dst_parent, dst_name) = self.resolve_parent(dst_path)?;
+
+        // RAM filesystems only support renaming within one directory. Moving
+        // nodes between directories would also require updating `parent`.
+        if !Arc::ptr_eq(&src_parent, &dst_parent) {
+            return Err(VfsError::InvalidInput);
+        }
+        if src_name == dst_name {
+            return Ok(());
+        }
+
+        let mut children = src_parent.children.write();
+        if !children.contains_key(&src_name) {
+            return Err(VfsError::NotFound);
+        }
+        if children.contains_key(&dst_name) {
+            return Err(VfsError::AlreadyExists);
+        }
+        let node = children.remove(&src_name).unwrap();
+        children.insert(dst_name.into(), node);
+        Ok(())
+    }
+
     axfs_vfs::impl_vfs_dir_default! {}
+}
+
+impl DirNode {
+    /// Resolves the directory that owns `path` and the final path component.
+    ///
+    /// Paths are interpreted relative to this node. A leading `/` is accepted
+    /// because the VFS root passes absolute destination paths down to the
+    /// mounted filesystem.
+    fn resolve_parent(&self, path: &str) -> VfsResult<(Arc<DirNode>, String)> {
+        let relative = path.trim_start_matches('/');
+        let mut candidates = alloc::vec![relative];
+        if path.starts_with('/') {
+            // The VFS passes destination paths with their mount prefix still
+            // attached (e.g. `/tmp/f2` to the filesystem mounted at `/tmp`).
+            // Try every suffix until one resolves inside this directory.
+            for (idx, _) in relative.match_indices('/') {
+                candidates.push(&relative[idx + 1..]);
+            }
+        }
+
+        for candidate in candidates {
+            if let Ok(resolved) = self.resolve_relative_parent(candidate) {
+                return Ok(resolved);
+            }
+        }
+        Err(VfsError::NotFound)
+    }
+
+    fn resolve_relative_parent(&self, path: &str) -> VfsResult<(Arc<DirNode>, String)> {
+        let mut components = path
+            .split('/')
+            .filter(|s| !s.is_empty() && *s != ".")
+            .peekable();
+
+        let mut current = self.this.upgrade().ok_or(VfsError::NotFound)?;
+        loop {
+            let name = components.next().ok_or(VfsError::InvalidInput)?;
+            if components.peek().is_none() {
+                if name == ".." {
+                    return Err(VfsError::InvalidInput);
+                }
+                return Ok((current, String::from(name)));
+            }
+
+            let next = if name == ".." {
+                current.parent().ok_or(VfsError::NotFound)?
+            } else {
+                current
+                    .children
+                    .read()
+                    .get(name)
+                    .cloned()
+                    .ok_or(VfsError::NotFound)?
+            };
+            current = next
+                .as_any()
+                .downcast_ref::<DirNode>()
+                .ok_or(VfsError::NotADirectory)?
+                .this
+                .upgrade()
+                .ok_or(VfsError::NotFound)?;
+        }
+    }
 }
 
 fn split_path(path: &str) -> (&str, Option<&str>) {

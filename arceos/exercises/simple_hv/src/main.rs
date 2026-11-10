@@ -24,7 +24,8 @@ use csrs::{RiscvCsrTrait, CSR};
 use vcpu::_run_guest;
 use sbi::SbiMessage;
 use loader::load_vm_image;
-use axhal::mem::PhysAddr;
+use axmm::AddrSpace;
+use axhal::mem::{PhysAddr, VirtAddr};
 use crate::regs::GprIndex::{A0, A1};
 
 const VM_ENTRY: usize = 0x8020_0000;
@@ -50,7 +51,7 @@ fn main() {
     prepare_vm_pgtable(ept_root);
 
     // Kick off vm and wait for it to exit.
-    while !run_guest(&mut ctx) {
+    while !run_guest(&mut ctx, &uspace) {
     }
 
     panic!("Hypervisor ok!");
@@ -67,16 +68,21 @@ fn prepare_vm_pgtable(ept_root: PhysAddr) {
     }
 }
 
-fn run_guest(ctx: &mut VmCpuRegisters) -> bool {
+fn run_guest(ctx: &mut VmCpuRegisters, uspace: &AddrSpace) -> bool {
+    // Keep host interrupts disabled while switching the CSR state and entering
+    // the guest. Otherwise a timer interrupt can arrive after `stvec` points at
+    // `_guest_exit` but before `sscratch` holds the GuestInfo pointer.
+    let flags = axhal::arch::local_irq_save_and_disable();
     unsafe {
         _run_guest(ctx);
     }
-
-    vmexit_handler(ctx)
+    let stop = vmexit_handler(ctx, uspace);
+    axhal::arch::local_irq_restore(flags);
+    stop
 }
 
 #[allow(unreachable_code)]
-fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
+fn vmexit_handler(ctx: &mut VmCpuRegisters, uspace: &AddrSpace) -> bool {
     use scause::{Exception, Trap};
 
     let scause = scause::read();
@@ -102,14 +108,52 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
             }
         },
         Trap::Exception(Exception::IllegalInstruction) => {
+            // The guest reads `mhartid`, which is not available in VS-mode.
+            // Emulate `csrr rd, mhartid` with a stable virtual hart id.
+            let pc = ctx.guest_regs.sepc;
+            ax_println!("VmExit: illegal instruction at {:#x}", pc);
+            if let Some(insn) = read_guest_insn(uspace, pc) {
+                if insn & 0x7f == 0x73
+                    && (insn >> 12) & 0x7 == 0x2
+                    && (insn >> 20) & 0xfff == 0xf14
+                {
+                    let rd = (insn >> 7) & 0x1f;
+                    if let Some(reg) = crate::regs::GprIndex::from_raw(rd) {
+                        ctx.guest_regs.gprs.set_reg(reg, 0x1234);
+                    }
+                    ctx.guest_regs.sepc = pc.wrapping_add(4);
+                    return false;
+                }
+            }
             panic!("Bad instruction: {:#x} sepc: {:#x}",
                 stval::read(),
                 ctx.guest_regs.sepc
             );
         },
         Trap::Exception(Exception::LoadGuestPageFault) => {
+            // The guest's boot ROM load at GPA 0x40 is emulated: complete the
+            // `ld` instruction with the virtual boot-data word and skip it.
+            let pc = ctx.guest_regs.sepc;
+            let fault_addr = stval::read();
+            ax_println!("VmExit: guest page fault at {:#x}, pc {:#x}", fault_addr, pc);
+            if fault_addr == 0x40 {
+                if let Some(insn) = read_guest_insn(uspace, pc) {
+                    if insn & 0x7f == 0x03
+                        && (insn >> 12) & 0x7 == 0x3
+                        && (insn >> 15) & 0x1f == 0
+                        && ((insn as i32) >> 20) as usize == 0x40
+                    {
+                        let rd = (insn >> 7) & 0x1f;
+                        if let Some(reg) = crate::regs::GprIndex::from_raw(rd) {
+                            ctx.guest_regs.gprs.set_reg(reg, 0x6688);
+                        }
+                        ctx.guest_regs.sepc = pc.wrapping_add(4);
+                        return false;
+                    }
+                }
+            }
             panic!("LoadGuestPageFault: stval{:#x} sepc: {:#x}",
-                stval::read(),
+                fault_addr,
                 ctx.guest_regs.sepc
             );
         },
@@ -123,6 +167,12 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
         }
     }
     false
+}
+
+fn read_guest_insn(uspace: &AddrSpace, pc: usize) -> Option<u32> {
+    let mut buf = [0u8; 4];
+    uspace.read(VirtAddr::from(pc), &mut buf).ok()?;
+    Some(u32::from_le_bytes(buf))
 }
 
 fn prepare_guest_context(ctx: &mut VmCpuRegisters) {
@@ -140,7 +190,10 @@ fn prepare_guest_context(ctx: &mut VmCpuRegisters) {
     // Set sstatus in guest mode.
     let mut sstatus = sstatus::read();
     sstatus.set_spp(sstatus::SPP::Supervisor);
-    ctx.guest_regs.sstatus = sstatus.bits();
+    // The guest only performs synchronous SBI calls; keep interrupts off there
+    // so they cannot preempt the tiny guest before it issues its `ecall`.
+    // `sret` copies SPIE into SIE, so both bits must be cleared.
+    ctx.guest_regs.sstatus = sstatus.bits() & !0b10_0010;
     // Return to entry to start vm.
     ctx.guest_regs.sepc = VM_ENTRY;
 }
